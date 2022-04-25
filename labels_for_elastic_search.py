@@ -20,7 +20,6 @@ settings = {
 
 es.indices.create(index="jvmg_search", ignore=400, body=settings)
 
-es.indices.delete(index="jvmg_search", ignore=[400, 404])
 step_size = 20_000
 
 for i in range(0, 60_000_000, step_size):
