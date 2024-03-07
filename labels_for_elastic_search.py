@@ -1,48 +1,84 @@
 import elasticsearch
+from elasticsearch.helpers import bulk
 from SPARQLWrapper import SPARQLWrapper, JSONLD
+from rdflib import URIRef
+from tqdm import tqdm
 
 sparql = SPARQLWrapper("http://localhost:3030/public")
 sparql.setReturnFormat(JSONLD)
+index_name = "default"
 
 
-es = elasticsearch.Elasticsearch()
-es.indices.delete(index="jvmg_search", ignore=[400, 404])
-settings = {
-    "settings": {
+es = elasticsearch.Elasticsearch("http://localhost:9200")
+es.indices.delete(index=index_name, ignore=[400, 404])
+settings =  {
         "number_of_shards": 6,
-        "number_of_replicas": 0
-    },
-    'mappings':
-    {'properties':
-     {'object': {'type': 'wildcard'},
-      'predicate': {'type': 'wildcard'},
-      'subject': {'type': 'wildcard'}}}}
+        "number_of_replicas": 1
+    }
+mappings = {'properties': {
+        'uri': {'type': 'keyword'},
+        'label': {'type': 'wildcard'},
+        'graph': {'type': 'wildcard'},
+        'type': {'type': 'wildcard'}}}
 
-es.indices.create(index="jvmg_search", ignore=400, body=settings)
+es.indices.create(index=index_name, ignore=400, settings=settings, mappings=mappings)
 
-step_size = 20_000
+query = """
+prefix label: <http://www.w3.org/2000/01/rdf-schema#label>
+prefix type: <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>
+prefix graph_label: <http://mediagraph.link/jvmg/ont/shortLabel>
+construct {
+  graph ?graph_uri {
+    ?uri label: ?label .
+    ?uri type: ?type_uri .
+    ?graph_uri graph_label: ?graph .
+    ?type_uri label: ?type
+  }
+} WHERE {
+  graph ?graph_uri {
+    ?uri label: ?label .
+    ?uri type: ?type_uri
+    optional {
+      ?graph_uri graph_label: ?graph
+    }
+    optional {
+        ?type_uri label: ?type
+    }
+  }
+}"""
 
-for i in range(0, 60_000_000, step_size):
-    print(i)
-    query = f"""
-    CONSTRUCT {{?s ?p ?o}}
-    WHERE {{
-    ?s ?p ?o . filter isLiteral(?o)
-    }} LIMIT {step_size} OFFSET {i}"""
+sparql.setQuery(query)
+sparql_data = sparql.queryAndConvert()
 
-    sparql.setQuery(query)
-    sparql_data = sparql.query().convert()
-    if len(sparql_data) == 0:
-        break
+uri_query = """
+prefix label: <http://www.w3.org/2000/01/rdf-schema#label>
+prefix type: <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>
+select distinct ?uri ?graph
+where {
+  graph ?graph{
+    ?uri label: ?label .
+    ?uri type: ?type_uri
+  }
+}
+"""
 
-    bulk_data = []
-    for id, item in enumerate(sparql_data):
-        bulk_data.append({"index": {"_id": str(i+id),
-                                    "_index": "jvmg_search"}})
-        bulk_data.append({"subject": str(item[0]),
-                          "predicate": str(item[1]),
-                          "object": str(item[2])})
+LABEL = URIRef("http://www.w3.org/2000/01/rdf-schema#label")
+TYPE = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+GRAPH_LABEL = URIRef("http://mediagraph.link/jvmg/ont/shortLabel")
 
-    res = es.bulk(body=bulk_data)
-    if res["errors"]:
-        print(res)
+uris = list(sparql_data.query(uri_query))
+
+def gen_docs():
+    for uri, graph in uris:
+        labels = [str(item) for item in sparql_data.objects(subject=uri, predicate=LABEL)]
+        types = [str(item) for item in sparql_data.objects(subject=uri, predicate=TYPE)]
+        graph_labels = [str(item) for item in sparql_data.objects(subject=graph, predicate=GRAPH_LABEL)]
+        doc = {
+            "uri": str(uri),
+            "label": labels,
+            "type": types,
+            "graph": graph_labels
+        }
+        yield {"_index": index_name, "_source": doc}
+
+bulk(es, gen_docs())
